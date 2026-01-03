@@ -5,12 +5,14 @@ Thyme LLM Training on Large Corpus
 Enhanced training script for comprehensive text corpus.
 Supports multi-GPU, gradient accumulation, and larger models.
 
-Key improvements over train_books.py:
+Key improvements:
 - Larger vocabulary (32K BPE tokens)
 - Deeper axiom processing
 - Gradient accumulation for effective larger batches
 - Learning rate warmup
-- Better logging and checkpointing
+- COMPREHENSIVE LOGGING AND PROGRESS TRACKING
+- Periodic checkpointing (not just at epoch end)
+- Batch-level progress with ETA
 """
 
 import torch
@@ -29,8 +31,54 @@ import re
 import time
 import json
 import argparse
+import logging
+import sys
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
+from tqdm import tqdm
+
+# =============================================================================
+# LOGGING SETUP
+# =============================================================================
+
+def setup_logging(log_dir: Path, log_name: str = "training"):
+    """Setup comprehensive logging to both file and console."""
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{log_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    
+    # Create formatter
+    formatter = logging.Formatter(
+        '%(asctime)s | %(levelname)s | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # File handler
+    file_handler = logging.FileHandler(log_path)
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+    
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    
+    # Setup logger
+    logger = logging.getLogger('thyme')
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    # Also create a simple progress file that can be tailed
+    progress_path = log_dir / "progress.log"
+    progress_handler = logging.FileHandler(progress_path, mode='w')
+    progress_handler.setLevel(logging.INFO)
+    progress_handler.setFormatter(logging.Formatter('%(asctime)s | %(message)s', datefmt='%H:%M:%S'))
+    
+    progress_logger = logging.getLogger('progress')
+    progress_logger.setLevel(logging.INFO)
+    progress_logger.addHandler(progress_handler)
+    
+    return logger, progress_logger, log_path, progress_path
 
 # =============================================================================
 # CONFIGURATION
@@ -58,17 +106,54 @@ class Config:
     WARMUP_STEPS = 1000
     WEIGHT_DECAY = 0.01
     
+    # Logging & Checkpointing
+    LOG_EVERY_N_BATCHES = 100      # Log progress every N batches
+    CHECKPOINT_EVERY_N_BATCHES = 5000  # Save checkpoint every N batches
+    SAVE_HISTORY_EVERY_N_BATCHES = 1000  # Update history file every N batches
+    
     # Paths
     SCRIPT_DIR = Path(__file__).parent
     CORPUS_DIR = SCRIPT_DIR / "corpus"
     CHECKPOINT_DIR = SCRIPT_DIR / "checkpoints"
+    LOG_DIR = SCRIPT_DIR / "logs"
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+
+def format_time(seconds):
+    """Format seconds into human readable string."""
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    elif seconds < 3600:
+        return f"{seconds/60:.1f}m"
+    else:
+        return f"{seconds/3600:.1f}h"
+
+def estimate_vram_usage(batch_size, seq_len, vocab_size, embed_dim, n_gpus=1):
+    """Estimate VRAM usage in GB."""
+    # Rough estimation
+    params_memory = (vocab_size * embed_dim + embed_dim * 1024 + 1024 * vocab_size) * 4 / 1e9
+    activation_memory = batch_size * seq_len * embed_dim * 4 * 10 / 1e9  # ~10x for gradients
+    total = (params_memory + activation_memory) * n_gpus
+    return total
+
+def suggest_batch_size(available_vram_gb, seq_len=256, vocab_size=32000, embed_dim=512):
+    """Suggest optimal batch size based on available VRAM."""
+    for bs in [128, 64, 32, 16, 8]:
+        estimated = estimate_vram_usage(bs, seq_len, vocab_size, embed_dim)
+        if estimated < available_vram_gb * 0.8:  # Leave 20% headroom
+            return bs
+    return 8
 
 # =============================================================================
 # DATA LOADING
 # =============================================================================
 
-def load_corpus(corpus_dir: Path, max_files: int = None) -> str:
+def load_corpus(corpus_dir: Path, max_files: int = None, logger=None) -> str:
     """Load all text files from corpus directory."""
+    log = logger.info if logger else print
+    
     texts = []
     total_chars = 0
     
@@ -79,25 +164,25 @@ def load_corpus(corpus_dir: Path, max_files: int = None) -> str:
         if max_files:
             book_files = book_files[:max_files]
         
-        for path in book_files:
+        for path in tqdm(book_files, desc="Loading books", disable=logger is None):
             with open(path, 'r', encoding='utf-8', errors='ignore') as f:
                 text = f.read()
             texts.append(text)
             total_chars += len(text)
-        print(f"  Loaded {len(book_files)} books ({total_chars/1e6:.1f}M chars)")
+        log(f"Loaded {len(book_files)} books ({total_chars/1e6:.1f}M chars)")
     
     # Load Wikipedia
     wiki_dir = corpus_dir / "wikipedia"
     if wiki_dir.exists():
         wiki_files = sorted(wiki_dir.glob("*.txt"))
         wiki_chars = 0
-        for path in wiki_files:
+        for path in tqdm(wiki_files, desc="Loading wiki", disable=logger is None):
             with open(path, 'r', encoding='utf-8', errors='ignore') as f:
                 text = f.read()
             texts.append(text)
             wiki_chars += len(text)
         total_chars += wiki_chars
-        print(f"  Loaded {len(wiki_files)} wiki batches ({wiki_chars/1e6:.1f}M chars)")
+        log(f"Loaded {len(wiki_files)} wiki batches ({wiki_chars/1e6:.1f}M chars)")
     
     # Fallback to books directory if corpus not prepared
     if not texts:
@@ -108,9 +193,9 @@ def load_corpus(corpus_dir: Path, max_files: int = None) -> str:
                     text = f.read()
                 texts.append(text)
                 total_chars += len(text)
-            print(f"  Loaded {len(texts)} books from fallback ({total_chars/1e6:.1f}M chars)")
+            log(f"Loaded {len(texts)} books from fallback ({total_chars/1e6:.1f}M chars)")
     
-    print(f"  Total corpus: {total_chars/1e9:.2f} GB")
+    log(f"Total corpus: {total_chars/1e9:.2f} GB")
     return '\n\n'.join(texts)
 
 def create_chunks(text: str, chunk_size: int = 1000) -> list:
@@ -210,13 +295,15 @@ class CorpusTokenizer:
 # =============================================================================
 
 class CorpusDataset(Dataset):
-    def __init__(self, chunks, tokenizer, max_len=256):
+    def __init__(self, chunks, tokenizer, max_len=256, logger=None):
         self.tokenizer = tokenizer
         self.max_len = max_len
         self.samples = []
         
-        print("Tokenizing chunks...")
-        for chunk in chunks:
+        log = logger.info if logger else print
+        log("Tokenizing chunks...")
+        
+        for chunk in tqdm(chunks, desc="Tokenizing", disable=logger is None):
             ids = tokenizer.encode(chunk)
             # Create overlapping windows
             stride = max_len // 2
@@ -225,7 +312,7 @@ class CorpusDataset(Dataset):
                 if len(window) > 10:
                     self.samples.append(window)
         
-        print(f"Created {len(self.samples):,} training samples")
+        log(f"Created {len(self.samples):,} training samples")
     
     def __len__(self):
         return len(self.samples)
@@ -406,7 +493,7 @@ class ThymeLM(nn.Module):
         return torch.cat(generated, dim=1)
 
 # =============================================================================
-# TRAINING
+# TRAINING WITH COMPREHENSIVE LOGGING
 # =============================================================================
 
 def get_lr(step, warmup_steps, max_lr, total_steps):
@@ -417,34 +504,55 @@ def get_lr(step, warmup_steps, max_lr, total_steps):
         progress = (step - warmup_steps) / (total_steps - warmup_steps)
         return max_lr * 0.5 * (1 + np.cos(np.pi * progress))
 
-def train(model, train_loader, val_loader, config, device, save_dir):
-    """Training loop with gradient accumulation and mixed precision."""
+def train(model, train_loader, val_loader, config, device, save_dir, logger, progress_logger):
+    """Training loop with comprehensive logging and periodic checkpointing."""
     model = model.to(device)
     
     # Multi-GPU
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs")
+    n_gpus = torch.cuda.device_count()
+    if n_gpus > 1:
+        logger.info(f"Using {n_gpus} GPUs")
         model = nn.DataParallel(model)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.LR, weight_decay=config.WEIGHT_DECAY)
     scaler = GradScaler()
     
-    total_steps = len(train_loader) * config.EPOCHS // config.GRAD_ACCUM
+    total_batches = len(train_loader)
+    total_steps = total_batches * config.EPOCHS // config.GRAD_ACCUM
+    
+    logger.info(f"Total batches per epoch: {total_batches:,}")
+    logger.info(f"Total optimizer steps: {total_steps:,}")
+    logger.info(f"Effective batch size: {config.BATCH_SIZE * config.GRAD_ACCUM * max(1, n_gpus)}")
     
     best_val_loss = float('inf')
     best_model_path = save_dir / 'thyme_corpus_best.pt'
-    history = {'train_loss': [], 'val_loss': [], 'train_ppl': [], 'val_ppl': []}
+    latest_model_path = save_dir / 'thyme_corpus_latest.pt'
+    history = {
+        'train_loss': [], 'val_loss': [], 'train_ppl': [], 'val_ppl': [],
+        'batch_losses': [], 'learning_rates': [], 'timestamps': []
+    }
     
     global_step = 0
+    start_time = time.time()
     
     for epoch in range(config.EPOCHS):
+        epoch_start = time.time()
+        
         # Training
         model.train()
         train_loss = 0
         n_batches = 0
         optimizer.zero_grad()
+        batch_losses = []
         
-        for batch_idx, (inp, tgt) in enumerate(train_loader):
+        logger.info(f"\n{'='*70}")
+        logger.info(f"EPOCH {epoch+1}/{config.EPOCHS}")
+        logger.info(f"{'='*70}")
+        
+        pbar = tqdm(enumerate(train_loader), total=total_batches, 
+                    desc=f"Epoch {epoch+1}", leave=True)
+        
+        for batch_idx, (inp, tgt) in pbar:
             inp, tgt = inp.to(device), tgt.to(device)
             
             # Update learning rate
@@ -474,17 +582,70 @@ def train(model, train_loader, val_loader, config, device, save_dir):
                 optimizer.zero_grad()
                 global_step += 1
             
-            train_loss += loss.item() * config.GRAD_ACCUM
+            batch_loss = loss.item() * config.GRAD_ACCUM
+            train_loss += batch_loss
+            batch_losses.append(batch_loss)
             n_batches += 1
+            
+            # Update progress bar
+            avg_loss = train_loss / n_batches
+            pbar.set_postfix({
+                'loss': f'{avg_loss:.3f}',
+                'ppl': f'{np.exp(avg_loss):.1f}',
+                'lr': f'{lr:.2e}'
+            })
+            
+            # Periodic logging
+            if (batch_idx + 1) % config.LOG_EVERY_N_BATCHES == 0:
+                elapsed = time.time() - start_time
+                batches_done = epoch * total_batches + batch_idx + 1
+                batches_total = config.EPOCHS * total_batches
+                eta = elapsed / batches_done * (batches_total - batches_done)
+                
+                progress_msg = (
+                    f"E{epoch+1} B{batch_idx+1}/{total_batches} | "
+                    f"Loss: {avg_loss:.3f} | PPL: {np.exp(avg_loss):.1f} | "
+                    f"LR: {lr:.2e} | ETA: {format_time(eta)}"
+                )
+                progress_logger.info(progress_msg)
+                
+                # Save to history
+                history['batch_losses'].append(batch_loss)
+                history['learning_rates'].append(lr)
+                history['timestamps'].append(time.time() - start_time)
+            
+            # Periodic checkpoint
+            if (batch_idx + 1) % config.CHECKPOINT_EVERY_N_BATCHES == 0:
+                logger.info(f"Saving periodic checkpoint at batch {batch_idx+1}...")
+                base_model = model.module if hasattr(model, 'module') else model
+                torch.save({
+                    'epoch': epoch,
+                    'batch': batch_idx,
+                    'model_state_dict': base_model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': avg_loss,
+                    'global_step': global_step
+                }, latest_model_path)
+                
+                # Also save history periodically
+                with open(save_dir / 'training_history.json', 'w') as f:
+                    json.dump(history, f, indent=2)
+            
+            # Save history periodically (more frequent than checkpoints)
+            if (batch_idx + 1) % config.SAVE_HISTORY_EVERY_N_BATCHES == 0:
+                with open(save_dir / 'training_history.json', 'w') as f:
+                    json.dump(history, f, indent=2)
         
         train_loss /= n_batches
+        epoch_time = time.time() - epoch_start
         
         # Validation
+        logger.info(f"Running validation...")
         model.eval()
         val_loss = 0
         vn = 0
         with torch.no_grad():
-            for inp, tgt in val_loader:
+            for inp, tgt in tqdm(val_loader, desc="Validation", leave=False):
                 inp, tgt = inp.to(device), tgt.to(device)
                 logits, _ = model(inp)
                 base_model = model.module if hasattr(model, 'module') else model
@@ -505,20 +666,30 @@ def train(model, train_loader, val_loader, config, device, save_dir):
         history['train_ppl'].append(train_ppl)
         history['val_ppl'].append(val_ppl)
         
-        marker = "★" if val_loss < best_val_loss else ""
-        print(f"Epoch {epoch+1:2d}/{config.EPOCHS} | "
-              f"Train: {train_loss:.3f} (PPL {train_ppl:.1f}) | "
-              f"Val: {val_loss:.3f} (PPL {val_ppl:.1f}) | "
-              f"LR: {lr:.2e} {marker}")
+        # Log epoch summary
+        marker = "★ NEW BEST" if val_loss < best_val_loss else ""
+        epoch_summary = (
+            f"Epoch {epoch+1:2d}/{config.EPOCHS} COMPLETE | "
+            f"Train: {train_loss:.3f} (PPL {train_ppl:.1f}) | "
+            f"Val: {val_loss:.3f} (PPL {val_ppl:.1f}) | "
+            f"Time: {format_time(epoch_time)} | "
+            f"LR: {lr:.2e} {marker}"
+        )
+        logger.info(epoch_summary)
+        progress_logger.info(epoch_summary)
         
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             base_model = model.module if hasattr(model, 'module') else model
             torch.save(base_model.state_dict(), best_model_path)
+            logger.info(f"Saved new best model to {best_model_path}")
+        
+        # Save history after each epoch
+        with open(save_dir / 'training_history.json', 'w') as f:
+            json.dump(history, f, indent=2)
     
-    # Save history
-    with open(save_dir / 'training_history.json', 'w') as f:
-        json.dump(history, f, indent=2)
+    total_time = time.time() - start_time
+    logger.info(f"\nTotal training time: {format_time(total_time)}")
     
     return best_val_loss, best_model_path, history
 
@@ -533,39 +704,62 @@ def main():
     parser.add_argument('--lr', type=float, default=Config.LR)
     parser.add_argument('--max-files', type=int, default=None, help='Limit corpus files')
     parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
+    parser.add_argument('--log-every', type=int, default=Config.LOG_EVERY_N_BATCHES, 
+                        help='Log every N batches')
+    parser.add_argument('--checkpoint-every', type=int, default=Config.CHECKPOINT_EVERY_N_BATCHES,
+                        help='Save checkpoint every N batches')
     args = parser.parse_args()
     
     # Update config
     Config.EPOCHS = args.epochs
     Config.BATCH_SIZE = args.batch_size
     Config.LR = args.lr
+    Config.LOG_EVERY_N_BATCHES = args.log_every
+    Config.CHECKPOINT_EVERY_N_BATCHES = args.checkpoint_every
     
-    print("="*70)
-    print("THYME TRAINING ON LARGE CORPUS")
-    print("="*70)
-    print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    # Setup logging
+    Config.LOG_DIR.mkdir(parents=True, exist_ok=True)
+    Config.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    logger, progress_logger, log_path, progress_path = setup_logging(Config.LOG_DIR)
+    
+    logger.info("="*70)
+    logger.info("THYME TRAINING ON LARGE CORPUS")
+    logger.info("="*70)
+    logger.info(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"Log file: {log_path}")
+    logger.info(f"Progress file: {progress_path}")
+    logger.info(f"  (Monitor with: tail -f {progress_path})")
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}")
-    if torch.cuda.is_available():
-        print(f"GPUs: {torch.cuda.device_count()}")
+    logger.info(f"Device: {device}")
     
-    Config.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    if torch.cuda.is_available():
+        n_gpus = torch.cuda.device_count()
+        logger.info(f"GPUs: {n_gpus}")
+        for i in range(n_gpus):
+            props = torch.cuda.get_device_properties(i)
+            logger.info(f"  GPU {i}: {props.name} ({props.total_memory/1e9:.1f} GB)")
+        
+        # Suggest batch size
+        total_vram = sum(torch.cuda.get_device_properties(i).total_memory for i in range(n_gpus)) / 1e9
+        suggested_bs = suggest_batch_size(total_vram / n_gpus)
+        logger.info(f"  Total VRAM: {total_vram:.1f} GB")
+        logger.info(f"  Suggested batch size: {suggested_bs} (current: {Config.BATCH_SIZE})")
     
     # Load corpus
-    print("\nLoading corpus...")
-    text = load_corpus(Config.CORPUS_DIR, args.max_files)
+    logger.info("\nLoading corpus...")
+    text = load_corpus(Config.CORPUS_DIR, args.max_files, logger)
     
     if len(text) == 0:
-        print("\nERROR: No corpus found!")
-        print(f"Please run: python prepare_corpus.py --gutenberg")
-        print(f"Or add .txt files to: {Config.CORPUS_DIR}")
+        logger.error("\nERROR: No corpus found!")
+        logger.error(f"Please run: python prepare_corpus.py --gutenberg")
+        logger.error(f"Or add .txt files to: {Config.CORPUS_DIR}")
         return
     
     # Create chunks
-    print("\nCreating chunks...")
+    logger.info("\nCreating chunks...")
     chunks = create_chunks(text, chunk_size=1000)
-    print(f"Chunks: {len(chunks):,}")
+    logger.info(f"Chunks: {len(chunks):,}")
     
     # Split
     np.random.seed(42)
@@ -573,29 +767,29 @@ def main():
     split = int(len(chunks) * 0.95)
     train_chunks = chunks[:split]
     val_chunks = chunks[split:]
-    print(f"Train: {len(train_chunks):,} | Val: {len(val_chunks):,}")
+    logger.info(f"Train: {len(train_chunks):,} | Val: {len(val_chunks):,}")
     
     # Tokenizer
     tokenizer_path = Config.CHECKPOINT_DIR / 'tokenizer_corpus.json'
     if tokenizer_path.exists() and not args.resume:
-        print("\nLoading existing tokenizer...")
+        logger.info("\nLoading existing tokenizer...")
         tokenizer = CorpusTokenizer.load(tokenizer_path)
     else:
-        print("\nTraining tokenizer...")
+        logger.info("\nTraining tokenizer...")
         tokenizer = CorpusTokenizer(vocab_size=Config.VOCAB_SIZE)
         tokenizer.train(chunks, tokenizer_path)
-    print(f"Vocab size: {tokenizer.vocab_size:,}")
+    logger.info(f"Vocab size: {tokenizer.vocab_size:,}")
     
     # Datasets
-    print("\nCreating datasets...")
-    train_ds = CorpusDataset(train_chunks, tokenizer, max_len=Config.MAX_LEN)
-    val_ds = CorpusDataset(val_chunks, tokenizer, max_len=Config.MAX_LEN)
+    logger.info("\nCreating datasets...")
+    train_ds = CorpusDataset(train_chunks, tokenizer, max_len=Config.MAX_LEN, logger=logger)
+    val_ds = CorpusDataset(val_chunks, tokenizer, max_len=Config.MAX_LEN, logger=logger)
     
     train_loader = DataLoader(train_ds, batch_size=Config.BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=Config.BATCH_SIZE, num_workers=4, pin_memory=True)
     
     # Model
-    print("\nCreating model...")
+    logger.info("\nCreating model...")
     model = ThymeLM(
         vocab_size=tokenizer.vocab_size,
         embed_dim=Config.EMBED_DIM,
@@ -604,29 +798,48 @@ def main():
     )
     
     if args.resume:
-        print(f"Resuming from {args.resume}")
-        model.load_state_dict(torch.load(args.resume, map_location=device))
+        logger.info(f"Resuming from {args.resume}")
+        checkpoint = torch.load(args.resume, map_location=device)
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+            logger.info(f"  Resumed from epoch {checkpoint.get('epoch', '?')}, batch {checkpoint.get('batch', '?')}")
+        else:
+            model.load_state_dict(checkpoint)
     
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"Parameters: {n_params:,}")
-    print(f"State size: {Config.N_STATE * 4:,} bytes (constant)")
+    logger.info(f"Parameters: {n_params:,}")
+    logger.info(f"State size: {Config.N_STATE * 4:,} bytes (constant)")
+    
+    # Training config summary
+    logger.info("\n" + "-"*70)
+    logger.info("TRAINING CONFIGURATION")
+    logger.info("-"*70)
+    logger.info(f"Epochs: {Config.EPOCHS}")
+    logger.info(f"Batch size: {Config.BATCH_SIZE} (per GPU)")
+    logger.info(f"Gradient accumulation: {Config.GRAD_ACCUM}")
+    logger.info(f"Learning rate: {Config.LR}")
+    logger.info(f"Log every: {Config.LOG_EVERY_N_BATCHES} batches")
+    logger.info(f"Checkpoint every: {Config.CHECKPOINT_EVERY_N_BATCHES} batches")
     
     # Train
-    print("\n" + "-"*70)
-    print("TRAINING")
-    print("-"*70)
+    logger.info("\n" + "-"*70)
+    logger.info("TRAINING")
+    logger.info("-"*70)
     
     start = time.time()
-    best_loss, best_path, history = train(model, train_loader, val_loader, Config, device, Config.CHECKPOINT_DIR)
+    best_loss, best_path, history = train(
+        model, train_loader, val_loader, Config, device, 
+        Config.CHECKPOINT_DIR, logger, progress_logger
+    )
     elapsed = time.time() - start
     
-    print(f"\nTraining time: {elapsed/60:.1f} minutes")
-    print(f"Best validation loss: {best_loss:.3f} (PPL {np.exp(best_loss):.1f})")
+    logger.info(f"\nTraining time: {format_time(elapsed)}")
+    logger.info(f"Best validation loss: {best_loss:.3f} (PPL {np.exp(best_loss):.1f})")
     
     # Generate samples
-    print("\n" + "-"*70)
-    print("GENERATION SAMPLES")
-    print("-"*70)
+    logger.info("\n" + "-"*70)
+    logger.info("GENERATION SAMPLES")
+    logger.info("-"*70)
     
     model.load_state_dict(torch.load(best_path, map_location=device))
     model = model.to(device)
@@ -644,15 +857,17 @@ def main():
         prompt_ids = torch.tensor([tokenizer.encode(prompt)[:-1]], device=device)
         gen = model.generate(prompt_ids, max_new=50, temp=0.7)
         text = tokenizer.decode(gen[0].tolist())
-        print(f"\n'{prompt}'")
-        print(f"  → {text[:150]}...")
+        logger.info(f"\n'{prompt}'")
+        logger.info(f"  → {text[:150]}...")
     
-    print("\n" + "="*70)
-    print("TRAINING COMPLETE")
-    print("="*70)
-    print(f"Model: {best_path}")
-    print(f"Tokenizer: {tokenizer_path}")
-    print(f"State size: {Config.N_STATE * 4:,} bytes (constant)")
+    logger.info("\n" + "="*70)
+    logger.info("TRAINING COMPLETE")
+    logger.info("="*70)
+    logger.info(f"Model: {best_path}")
+    logger.info(f"Tokenizer: {tokenizer_path}")
+    logger.info(f"State size: {Config.N_STATE * 4:,} bytes (constant)")
+    logger.info(f"Log: {log_path}")
+    logger.info(f"Progress: {progress_path}")
 
 if __name__ == "__main__":
     main()
